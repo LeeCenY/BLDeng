@@ -6,13 +6,15 @@
 use crate::dns_table;
 use crate::doh_client;
 use crate::logging;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -54,15 +56,14 @@ pub fn start(fd: i32, socks_port: u16, _dns_port: u16) -> Result<(), String> {
         tokio_handler(tun_rx, socks_tx, socks_addr2).await;
     });
 
-    // Spawn the packet processing thread (reads/writes fd, drives smoltcp)
-    std::thread::Builder::new()
-        .name("smoltcp-tun2socks".into())
-        .spawn(move || {
-            packet_thread(fd, tun_tx, socks_rx);
-            TUN2SOCKS_RUNNING.store(false, Ordering::SeqCst);
-            info!("tun2socks packet thread exited");
-        })
-        .map_err(|e| format!("spawn packet thread: {}", e))?;
+    // Spawn the async packet task (reads/writes fd via AsyncFd, drives smoltcp)
+    rt.spawn(async move {
+        if let Err(e) = packet_task(fd, tun_tx, socks_rx).await {
+            logging::bridge_log(&format!("packet_task error: {}", e));
+        }
+        TUN2SOCKS_RUNNING.store(false, Ordering::SeqCst);
+        info!("tun2socks packet task exited");
+    });
 
     Ok(())
 }
@@ -221,12 +222,37 @@ struct ConnInfo {
 // Packet thread (replaces lwip_thread)
 // ---------------------------------------------------------------------------
 
-fn packet_thread(
+/// Write a packet to the TUN fd, awaiting writability via AsyncFd.
+async fn write_tun_packet(async_fd: &AsyncFd<RawFd>, data: &[u8]) -> io::Result<isize> {
+    loop {
+        let mut guard = async_fd.writable().await?;
+        let n = unsafe {
+            libc::write(
+                *async_fd.get_ref(),
+                data.as_ptr() as *const c_void,
+                data.len(),
+            )
+        };
+        if n >= 0 {
+            guard.clear_ready();
+            return Ok(n);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            guard.clear_ready();
+            continue;
+        }
+        guard.clear_ready();
+        return Err(err);
+    }
+}
+
+async fn packet_task(
     fd: RawFd,
     tun_tx: mpsc::UnboundedSender<TunEvent>,
     mut socks_rx: mpsc::UnboundedReceiver<SocksEvent>,
-) {
-    logging::bridge_log("packet_thread: starting (smoltcp)");
+) -> io::Result<()> {
+    logging::bridge_log("packet_task: starting (smoltcp + AsyncFd)");
 
     // Create smoltcp device and interface
     let mut device = TunDevice::new(1500);
@@ -261,15 +287,18 @@ fn packet_thread(
         });
     }
 
-    logging::bridge_log(&format!("packet_thread: {} sockets allocated", MAX_SOCKETS));
+    logging::bridge_log(&format!("packet_task: {} sockets allocated", MAX_SOCKETS));
 
-    // Set fd to non-blocking
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
+    // Set fd to non-blocking using nix
+    let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(|_| io::Error::last_os_error())?;
+    let mut new_flags = OFlag::from_bits_truncate(flags);
+    new_flags.insert(OFlag::O_NONBLOCK);
+    fcntl(fd, FcntlArg::F_SETFL(new_flags)).map_err(|_| io::Error::last_os_error())?;
 
-    logging::bridge_log("packet_thread: entering main loop");
+    // Wrap fd in AsyncFd for tokio-driven I/O
+    let async_fd = AsyncFd::new(fd)?;
+
+    logging::bridge_log("packet_task: entering main loop");
 
     let mut read_buf = vec![0u8; 65535];
     let mut pkt_total: u64 = 0;
@@ -286,78 +315,108 @@ fn packet_thread(
     let mut last_stats = Instant::now();
     let start_time = Instant::now();
 
-    // Main loop
+    // Periodic tick for smoltcp maintenance (retransmits, timeouts)
+    let mut interval = tokio::time::interval(Duration::from_millis(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Main loop — driven by tokio::select! instead of libc::select
     while TUN2SOCKS_RUNNING.load(Ordering::SeqCst) {
         let now_millis = start_time.elapsed().as_millis() as i64;
         let smol_now = SmolInstant::from_millis(now_millis);
 
-        // 1. Read packets from fd
-        loop {
-            let n = unsafe {
-                libc::read(fd, read_buf.as_mut_ptr() as *mut c_void, read_buf.len())
-            };
-            if n < 0 {
-                let errno = unsafe { *libc::__error() };
-                if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
-                    read_errors += 1;
-                    if read_errors <= 5 {
-                        logging::bridge_log(&format!(
-                            "packet_thread: read error: errno={}", errno
-                        ));
+        // Capture first socks event from select (if that branch wins)
+        let mut first_socks_event: Option<SocksEvent> = None;
+
+        // Wait for fd readable, a SOCKS5 response event, or periodic tick
+        tokio::select! {
+            biased;
+
+            result = async_fd.readable() => {
+                match result {
+                    Ok(mut guard) => {
+                        // 1. Drain all available packets from fd
+                        loop {
+                            let n = unsafe {
+                                libc::read(fd, read_buf.as_mut_ptr() as *mut c_void, read_buf.len())
+                            };
+                            if n < 0 {
+                                let err = io::Error::last_os_error();
+                                if err.kind() != io::ErrorKind::WouldBlock {
+                                    read_errors += 1;
+                                    if read_errors <= 5 {
+                                        logging::bridge_log(&format!(
+                                            "packet_task: read error: {}", err
+                                        ));
+                                    }
+                                }
+                                break;
+                            }
+                            if n == 0 {
+                                break;
+                            }
+                            let n = n as usize;
+                            pkt_total += 1;
+                            // Strip 4-byte utun header
+                            if n <= 4 {
+                                continue;
+                            }
+                            let ip_data = &read_buf[4..n];
+
+                            // Log first few packets
+                            if pkt_total <= 5 {
+                                let version = if !ip_data.is_empty() { ip_data[0] >> 4 } else { 0 };
+                                let proto = if ip_data.len() > 9 { ip_data[9] } else { 0 };
+                                logging::bridge_log(&format!(
+                                    "packet_task: pkt #{}: {}B, ip_ver={}, proto={}",
+                                    pkt_total, n, version, proto
+                                ));
+                            }
+
+                            // Intercept UDP before smoltcp
+                            if let Some((src_ip, src_port, dst_ip, dst_port, payload)) =
+                                parse_udp_packet(ip_data)
+                            {
+                                pkt_udp += 1;
+                                if pkt_udp <= 3 {
+                                    let dst = Ipv4Addr::from(dst_ip.to_ne_bytes());
+                                    logging::bridge_log(&format!(
+                                        "packet_task: UDP -> {}:{} ({}B)",
+                                        dst, dst_port, payload.len()
+                                    ));
+                                }
+                                let _ = tun_tx.send(TunEvent::UdpPacket {
+                                    src_ip,
+                                    src_port,
+                                    dst_ip,
+                                    dst_port,
+                                    data: payload.to_vec(),
+                                });
+                            } else {
+                                // Check if TCP for stats
+                                if ip_data.len() > 9 && ip_data[9] == 6 {
+                                    pkt_tcp += 1;
+                                } else {
+                                    pkt_other += 1;
+                                }
+                                // Queue for smoltcp
+                                device.rx_queue.push_back(ip_data.to_vec());
+                            }
+                        }
+                        guard.clear_ready();
+                    }
+                    Err(e) => {
+                        logging::bridge_log(&format!("packet_task: AsyncFd readable error: {}", e));
+                        break;
                     }
                 }
-                break;
-            }
-            if n == 0 {
-                break;
-            }
-            let n = n as usize;
-            pkt_total += 1;
-            // Strip 4-byte utun header
-            if n <= 4 {
-                continue;
-            }
-            let ip_data = &read_buf[4..n];
-
-            // Log first few packets
-            if pkt_total <= 5 {
-                let version = if !ip_data.is_empty() { ip_data[0] >> 4 } else { 0 };
-                let proto = if ip_data.len() > 9 { ip_data[9] } else { 0 };
-                logging::bridge_log(&format!(
-                    "packet_thread: pkt #{}: {}B, ip_ver={}, proto={}",
-                    pkt_total, n, version, proto
-                ));
             }
 
-            // Intercept UDP before smoltcp
-            if let Some((src_ip, src_port, dst_ip, dst_port, payload)) =
-                parse_udp_packet(ip_data)
-            {
-                pkt_udp += 1;
-                if pkt_udp <= 3 {
-                    let dst = Ipv4Addr::from(dst_ip.to_ne_bytes());
-                    logging::bridge_log(&format!(
-                        "packet_thread: UDP -> {}:{} ({}B)",
-                        dst, dst_port, payload.len()
-                    ));
-                }
-                let _ = tun_tx.send(TunEvent::UdpPacket {
-                    src_ip,
-                    src_port,
-                    dst_ip,
-                    dst_port,
-                    data: payload.to_vec(),
-                });
-            } else {
-                // Check if TCP for stats
-                if ip_data.len() > 9 && ip_data[9] == 6 {
-                    pkt_tcp += 1;
-                } else {
-                    pkt_other += 1;
-                }
-                // Queue for smoltcp
-                device.rx_queue.push_back(ip_data.to_vec());
+            event = socks_rx.recv() => {
+                // Capture the event; process it together with any others below
+                first_socks_event = event;
             }
+
+            _ = interval.tick() => {}
         }
 
         // 2. Pre-inspect SYN packets and set up listening sockets
@@ -507,7 +566,12 @@ fn packet_thread(
         }
 
         // 5. Process events from tokio (SOCKS5 responses)
+        // Collect the event from select! (if any) and drain remaining pending events
+        let mut socks_events: Vec<SocksEvent> = first_socks_event.into_iter().collect();
         while let Ok(event) = socks_rx.try_recv() {
+            socks_events.push(event);
+        }
+        for event in socks_events {
             match event {
                 SocksEvent::TcpData { conn_id, data } => {
                     socks_data_recv += data.len() as u64;
@@ -570,8 +634,8 @@ fn packet_thread(
                     let mut pkt = Vec::with_capacity(4 + raw.len());
                     pkt.extend_from_slice(&2u32.to_be_bytes());
                     pkt.extend_from_slice(&raw);
-                    unsafe {
-                        libc::write(fd, pkt.as_ptr() as *const c_void, pkt.len());
+                    if let Err(e) = write_tun_packet(&async_fd, &pkt).await {
+                        logging::bridge_log(&format!("UDP reply write error: {}", e));
                     }
                 }
             }
@@ -580,7 +644,7 @@ fn packet_thread(
         // 6. Poll again to flush data written to sockets in step 5
         iface.poll(smol_now, &mut device, &mut sockets);
 
-        // 7. Drain TX queue — write smoltcp output packets to utun fd
+        // 7. Drain TX queue — write smoltcp output packets to utun fd via AsyncFd
         static TX_LOG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         while let Some(pkt) = device.tx_queue.pop_front() {
             if pkt.is_empty() {
@@ -619,25 +683,18 @@ fn packet_thread(
             out.extend_from_slice(&pkt);
             tx_pkt_count += 1;
             tx_byte_count += out.len() as u64;
-            let written = unsafe {
-                libc::write(fd, out.as_ptr() as *const c_void, out.len())
-            };
-            if written < 0 && tx_pkt_count <= 5 {
-                let errno = unsafe { *libc::__error() };
-                logging::bridge_log(&format!("TX write error: errno={}, pkt_len={}", errno, out.len()));
+            match write_tun_packet(&async_fd, &out).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if tx_pkt_count <= 5 {
+                        logging::bridge_log(&format!("TX write error: {}, pkt_len={}", e, out.len()));
+                    }
+                }
             }
         }
 
-        // 7. Wait for fd readable via select (wakes immediately on new packets)
-        unsafe {
-            let mut fds = libc::fd_set { fds_bits: [0; 32] };
-            libc::FD_SET(fd, &mut fds);
-            let mut timeout = libc::timeval { tv_sec: 0, tv_usec: 1000 }; // 1ms max
-            libc::select(fd + 1, &mut fds, std::ptr::null_mut(), std::ptr::null_mut(), &mut timeout);
-        }
-
         // 8. Periodic stats
-        if last_stats.elapsed() >= std::time::Duration::from_secs(5) {
+        if last_stats.elapsed() >= Duration::from_secs(5) {
             logging::bridge_log(&format!(
                 "STATS: rx={} udp={} tcp={} conns={} tx_pkts={} tx_bytes={} socks_recv={} socks_sent={} socks_drop={}",
                 pkt_total, pkt_udp, pkt_tcp, active_conns, tx_pkt_count, tx_byte_count,
@@ -647,7 +704,8 @@ fn packet_thread(
         }
     }
 
-    logging::bridge_log("packet_thread: exiting main loop");
+    logging::bridge_log("packet_task: exiting main loop");
+    Ok(())
 }
 
 /// Parse a TCP SYN packet, returning (dst_ip_ne, dst_port) if it's a SYN.

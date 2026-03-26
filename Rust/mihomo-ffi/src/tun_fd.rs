@@ -4,6 +4,7 @@ use mihomo_dns::{DnsServer, Resolver};
 use mihomo_listener::tun_conn::TunTcpConn;
 use mihomo_tunnel::Tunnel;
 use netstack_smoltcp::StackBuilder;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -96,11 +97,13 @@ impl TunFdListener {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let device = unsafe { RawTunDevice::from_raw_fd(self.fd as RawFd) };
 
-        // Set fd to non-blocking for tokio AsyncFd
-        unsafe {
-            let flags = libc::fcntl(self.fd, libc::F_GETFL);
-            libc::fcntl(self.fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+        // Set fd to non-blocking for tokio AsyncFd using nix
+        let flags = fcntl(self.fd, FcntlArg::F_GETFL)
+            .map_err(|_| io::Error::last_os_error())?;
+        let mut new_flags = OFlag::from_bits_truncate(flags);
+        new_flags.insert(OFlag::O_NONBLOCK);
+        fcntl(self.fd, FcntlArg::F_SETFL(new_flags))
+            .map_err(|_| io::Error::last_os_error())?;
 
         let async_device = Arc::new(AsyncFd::new(device)?);
 

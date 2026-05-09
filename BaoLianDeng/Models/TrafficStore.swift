@@ -150,7 +150,8 @@ final class TrafficStore: ObservableObject {
     }
 
     private func fetchConnections() {
-        let url = URL(string: "http://\(AppConstants.externalControllerAddr)/connections")!
+        guard let addr = AppConstants.externalControllerAddr,
+              let url = URL(string: "http://\(addr)/connections") else { return }
         URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
             guard let data = data, error == nil else { return }
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

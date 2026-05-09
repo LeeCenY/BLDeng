@@ -394,7 +394,8 @@ struct HomeView: View {
     }
 
     static func reloadMihomoConfig(with yaml: String) async {
-        guard let url = URL(string: "http://\(AppConstants.externalControllerAddr)/configs?force=true") else { return }
+        guard let addr = AppConstants.externalControllerAddr,
+              let url = URL(string: "http://\(addr)/configs?force=true") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

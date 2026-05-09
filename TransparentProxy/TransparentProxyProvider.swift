@@ -30,9 +30,15 @@ class TransparentProxyProvider: NETransparentProxyProvider {
     private var perAppBundleIDSet: Set<String> = []
 
     private static let socksHost = "127.0.0.1"
-    private static let socksPort: UInt16 = 7890
     private static let mihomoDNSHost = "127.0.0.1"
-    private static let mihomoDNSPort: UInt16 = 1053
+
+    /// Ports the main app picked for this tunnel session, forwarded via
+    /// providerConfiguration in setupConfigFromProvider(). Mihomo binds
+    /// these in startProxy(). Defaulting to 0 / "" makes a stray flow
+    /// arriving before startup completes fail fast.
+    private var socksPort: UInt16 = 0
+    private var mihomoDNSPort: UInt16 = 0
+    private var controllerAddr: String = ""
 
     private lazy var logURL: URL = {
         let dir = ConfigManager.shared.configDirectoryURL?.deletingLastPathComponent()
@@ -114,17 +120,30 @@ class TransparentProxyProvider: NETransparentProxyProvider {
             self?.log("Setting home dir: \(configDir)")
             BridgeSetHomeDir(configDir)
 
-            self?.log("Starting Mihomo proxy engine")
+            // Use the ports the main app picked & forwarded via
+            // providerConfiguration. setupConfigFromProvider() stashed
+            // them on `self` already; default to 0 so a missing field
+            // fails fast rather than silently binding 7890/1053.
+            let socks = self?.socksPort ?? 0
+            let dns = self?.mihomoDNSPort ?? 0
+            let ctrl = self?.controllerAddr ?? ""
+            guard socks > 0, dns > 0, !ctrl.isEmpty else {
+                self?.log("ERROR: provider configuration missing ports/controllerAddr")
+                completionHandler(ProviderError.configNotFound)
+                return
+            }
+            self?.log(
+                "Starting Mihomo proxy engine: socks=\(socks) dns=\(dns) controller=\(ctrl)"
+            )
             var startError: NSError?
-            BridgeStartWithExternalController(
-                AppConstants.externalControllerAddr, "", &startError
+            BridgeStartWithPorts(
+                Int32(socks), Int32(dns), ctrl, "", &startError
             )
             if let startError = startError {
-                self?.log("ERROR: BridgeStartWithExternalController failed: \(startError)")
+                self?.log("ERROR: BridgeStartWithPorts failed: \(startError)")
                 completionHandler(startError)
                 return
             }
-            self?.log("Proxy engine started")
 
             self?.proxyStarted = true
             self?.setupLogging()
@@ -201,13 +220,14 @@ class TransparentProxyProvider: NETransparentProxyProvider {
             do {
                 // Connect to Mihomo's SOCKS5 proxy
                 let conn = try await SOCKS5Client.connectTCP(
-                    host: Self.socksHost, port: Self.socksPort
+                    host: Self.socksHost, port: self.socksPort
                 )
                 socksConn = conn
 
                 // SOCKS5 handshake — pass the raw destination IP; mihomo
                 // recovers the domain via its DNS snooping reverse cache
-                // (populated from the UDP DNS queries we forward to 1053).
+                // (populated from the UDP DNS queries we forward to its
+                // ephemeral DNS port).
                 try await SOCKS5Client.handshake(
                     connection: conn,
                     destHost: destHost,
@@ -342,11 +362,11 @@ class TransparentProxyProvider: NETransparentProxyProvider {
         }
     }
 
-    /// Forward a UDP DNS query directly to mihomo's DNS server on
-    /// `127.0.0.1:1053` and relay the response back to the app. Mihomo
-    /// populates its own snooping cache from the query, and its SOCKS5
-    /// listener uses that cache to recover the domain when subsequent
-    /// TCP flows arrive with only an IP.
+    /// Forward a UDP DNS query directly to mihomo's DNS server on the
+    /// ephemeral port stored in `mihomoDNSPort` and relay the response
+    /// back to the app. Mihomo populates its own snooping cache from the
+    /// query, and its SOCKS5 listener uses that cache to recover the
+    /// domain when subsequent TCP flows arrive with only an IP.
     private func handleDNSQuery(
         query: Data, flow: NEAppProxyUDPFlow, endpoint: NWHostEndpoint
     ) async {
@@ -365,7 +385,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
     }
 
     /// Synchronous UDP round-trip to mihomo's DNS server on
-    /// `127.0.0.1:1053`. Loopback so per-query sockets are cheap.
+    /// `127.0.0.1:<mihomoDNSPort>`. Loopback so per-query sockets are cheap.
     private func sendDNSToMihomo(query: Data) -> Data? {
         let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard sock >= 0 else { return nil }
@@ -380,7 +400,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(Self.mihomoDNSPort).bigEndian
+        addr.sin_port = in_port_t(self.mihomoDNSPort).bigEndian
         inet_pton(AF_INET, Self.mihomoDNSHost, &addr.sin_addr)
 
         let sent = query.withUnsafeBytes { buf -> Int in
@@ -625,6 +645,17 @@ class TransparentProxyProvider: NETransparentProxyProvider {
             self.perAppSettings = settings
             self.perAppBundleIDSet = Set(settings.apps.map(\.bundleID))
             log("Per-app proxy: enabled=\(settings.enabled) mode=\(settings.mode.rawValue) apps=\(settings.apps.count)")
+        }
+
+        // Pull the listener ports the main app picked for this run.
+        if let socks = providerConfig?["socksPort"] as? Int {
+            self.socksPort = UInt16(socks)
+        }
+        if let dns = providerConfig?["dnsPort"] as? Int {
+            self.mihomoDNSPort = UInt16(dns)
+        }
+        if let ctrl = providerConfig?["controllerAddr"] as? String {
+            self.controllerAddr = ctrl
         }
 
         return configDir

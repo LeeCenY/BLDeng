@@ -84,8 +84,14 @@ enum MihomoAPIError: Error, LocalizedError {
 }
 
 enum MihomoAPI {
+    /// Returns "" when the tunnel hasn't run yet (the live controller addr
+    /// is published by the extension at startup, not known up-front). The
+    /// empty string makes every URL(string:) call below fail to parse,
+    /// which surfaces as `MihomoAPIError.invalidURL` at the call site —
+    /// the same path as a real malformed URL.
     private static var baseURL: String {
-        "http://\(AppConstants.externalControllerAddr)"
+        guard let addr = AppConstants.externalControllerAddr else { return "" }
+        return "http://\(addr)"
     }
 
     // MARK: - Rules

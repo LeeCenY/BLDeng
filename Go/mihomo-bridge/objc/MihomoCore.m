@@ -4,7 +4,10 @@
 // C FFI declarations (from Rust staticlib)
 extern void bridge_set_home_dir(const char *dir);
 extern int32_t bridge_set_log_file(const char *path);
-extern int32_t bridge_start_with_external_controller(const char *addr, const char *secret);
+extern int32_t bridge_start_with_ports(int32_t socks_port, int32_t dns_port, const char *controller_addr, const char *secret);
+extern int32_t bridge_get_socks_port(void);
+extern int32_t bridge_get_dns_port(void);
+extern char *bridge_get_external_controller_addr(void);
 extern void bridge_stop_proxy(void);
 extern bool bridge_is_running(void);
 extern char *bridge_read_config(void);
@@ -36,13 +39,29 @@ void BridgeSetLogFile(NSString * _Nullable path) {
     bridge_set_log_file([path UTF8String]);
 }
 
-BOOL BridgeStartWithExternalController(NSString * _Nullable addr, NSString * _Nullable secret, NSError * _Nullable * _Nullable error) {
-    int32_t rc = bridge_start_with_external_controller([addr UTF8String], [secret UTF8String]);
+BOOL BridgeStartWithPorts(int32_t socksPort, int32_t dnsPort, NSString * _Nonnull controllerAddr, NSString * _Nullable secret, NSError * _Nullable * _Nullable error) {
+    int32_t rc = bridge_start_with_ports(socksPort, dnsPort, [controllerAddr UTF8String], [secret UTF8String]);
     if (rc != 0) {
         if (error) *error = makeError();
         return NO;
     }
     return YES;
+}
+
+int32_t BridgeGetSocksPort(void) {
+    return bridge_get_socks_port();
+}
+
+int32_t BridgeGetDNSPort(void) {
+    return bridge_get_dns_port();
+}
+
+NSString * _Nullable BridgeGetExternalControllerAddr(void) {
+    char *cstr = bridge_get_external_controller_addr();
+    if (cstr == NULL) return nil;
+    NSString *str = [NSString stringWithUTF8String:cstr];
+    bridge_free_string(cstr);
+    return str;
 }
 
 void BridgeStopProxy(void) {

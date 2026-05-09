@@ -32,7 +32,20 @@ var (
 	logSubOnce sync.Once
 
 	versionCStr *C.char // cached, never freed
+
+	// Ports/addr actually bound by mihomo this run. Reset on stop.
+	// Picked dynamically (port 0) to avoid colliding with other mihomo
+	// instances on the host. Read by Swift via the bridge_get_*_port /
+	// bridge_get_external_controller_addr accessors.
+	runtimeSocksPort      int
+	runtimeDNSPort        int
+	runtimeControllerAddr string
 )
+
+// (port picking lives in the main app — see VPNManager.swift —
+// because it needs to share the chosen numbers with the extension via
+// providerConfiguration AND with the app's own REST clients via its
+// UserDefaults. Picking on the Go side leaves the app process blind.)
 
 func bridgeLog(format string, args ...interface{}) {
 	logFileMu.Lock()
@@ -111,8 +124,19 @@ func bridge_validate_config(yaml *C.char) C.int32_t {
 	return 0
 }
 
-//export bridge_start_with_external_controller
-func bridge_start_with_external_controller(addr *C.char, secret *C.char) C.int32_t {
+// bridge_start_with_ports starts the engine on the caller-supplied
+// 127.0.0.1 ports. The main app picks them (via NWListener with port 0)
+// and forwards them here through the system extension; that way the
+// app's own REST clients know the controller port without needing an
+// IPC round-trip. Pass `controller_addr` as `host:port`.
+//
+//export bridge_start_with_ports
+func bridge_start_with_ports(
+	socks_port C.int32_t,
+	dns_port C.int32_t,
+	controller_addr *C.char,
+	secret *C.char,
+) C.int32_t {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 
@@ -120,11 +144,19 @@ func bridge_start_with_external_controller(addr *C.char, secret *C.char) C.int32
 		setLastError("proxy is already running")
 		return -1
 	}
-
-	addrStr := ""
-	if addr != nil {
-		addrStr = C.GoString(addr)
+	if socks_port <= 0 || dns_port <= 0 {
+		setLastError("socks_port and dns_port must be > 0")
+		return -1
 	}
+	if controller_addr == nil {
+		setLastError("controller_addr is null")
+		return -1
+	}
+
+	socksPort := int(socks_port)
+	dnsPort := int(dns_port)
+	addrStr := C.GoString(controller_addr)
+	dnsListen := fmt.Sprintf("127.0.0.1:%d", dnsPort)
 	secretStr := ""
 	if secret != nil {
 		secretStr = C.GoString(secret)
@@ -137,24 +169,74 @@ func bridge_start_with_external_controller(addr *C.char, secret *C.char) C.int32
 	}
 
 	// hub.Parse(nil, ...) reads the config file from constant.Path.Config(),
-	// applies the option overrides, then calls hub.ApplyConfig which starts
-	// the listeners, DNS server, and REST API.
+	// applies the option overrides (which run AFTER the YAML is parsed but
+	// BEFORE listeners start), then calls hub.ApplyConfig which starts
+	// the listeners, DNS server, and REST API. The custom option below
+	// overrides whatever ports the user wrote in config.yaml so we land
+	// on the caller-supplied ones.
 	err := hub.Parse(nil,
 		hub.WithExternalController(addrStr),
 		hub.WithSecret(secretStr),
+		func(cfg *config.Config) {
+			if cfg.General != nil {
+				cfg.General.MixedPort = socksPort
+				// Disable other inbound ports we don't use; if the user's
+				// config sets one we don't want it bound on a fixed port.
+				cfg.General.Port = 0
+				cfg.General.SocksPort = 0
+				cfg.General.RedirPort = 0
+				cfg.General.TProxyPort = 0
+			}
+			if cfg.DNS != nil {
+				cfg.DNS.Listen = dnsListen
+			}
+		},
 	)
 	if err != nil {
 		setLastError(fmt.Sprintf("hub.Parse: %v", err))
 		return -1
 	}
 
+	runtimeSocksPort = socksPort
+	runtimeDNSPort = dnsPort
+	runtimeControllerAddr = addrStr
+
 	runtime.GC()
 	debug.FreeOSMemory()
 
 	running = true
-	bridgeLog("Proxy started, external controller=%s", addrStr)
-	log.Infoln("Mihomo proxy engine started with external controller at %s", addrStr)
+	bridgeLog("Proxy started: socks=%d dns=%d controller=%s", socksPort, dnsPort, addrStr)
+	log.Infoln("Mihomo proxy engine started: socks=%d dns=%d controller=%s",
+		socksPort, dnsPort, addrStr)
 	return 0
+}
+
+//export bridge_get_socks_port
+func bridge_get_socks_port() C.int32_t {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	return C.int32_t(runtimeSocksPort)
+}
+
+//export bridge_get_dns_port
+func bridge_get_dns_port() C.int32_t {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	return C.int32_t(runtimeDNSPort)
+}
+
+// bridge_get_external_controller_addr returns the live controller addr
+// (e.g. "127.0.0.1:54321"). Caller owns the returned C string and must
+// release it via bridge_free_string.
+//
+//export bridge_get_external_controller_addr
+func bridge_get_external_controller_addr() *C.char {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if runtimeControllerAddr == "" {
+		return nil
+	}
+	return C.CString(runtimeControllerAddr)
 }
 
 //export bridge_stop_proxy
@@ -168,6 +250,9 @@ func bridge_stop_proxy() {
 	bridgeLog("StopProxy called")
 	executor.Shutdown()
 	running = false
+	runtimeSocksPort = 0
+	runtimeDNSPort = 0
+	runtimeControllerAddr = ""
 
 	runtime.GC()
 	debug.FreeOSMemory()

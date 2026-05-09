@@ -482,7 +482,16 @@ final class VPNManager: NSObject, ObservableObject {
     }
 
     private func selectNodeViaRestAPI(_ nodeName: String, retriesLeft: Int = 0) {
-        guard let url = URL(string: "http://\(AppConstants.externalControllerAddr)/proxies") else { return }
+        guard let addr = AppConstants.externalControllerAddr,
+              let url = URL(string: "http://\(addr)/proxies") else {
+            // Controller addr not yet published by the extension; retry.
+            if retriesLeft > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.selectNodeViaRestAPI(nodeName, retriesLeft: retriesLeft - 1)
+                }
+            }
+            return
+        }
         URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -530,7 +539,7 @@ final class VPNManager: NSObject, ObservableObject {
             self?.dbg("selectNode: \(nodeName) -> \(targets.map { "\($0.group)=\($0.selection)" })")
             for (groupName, selection) in targets {
                 guard let encoded = groupName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-                      let putURL = URL(string: "http://\(AppConstants.externalControllerAddr)/proxies/\(encoded)"),
+                      let putURL = URL(string: "http://\(addr)/proxies/\(encoded)"),
                       let body = try? JSONSerialization.data(withJSONObject: ["name": selection]) else { continue }
                 var request = URLRequest(url: putURL)
                 request.httpMethod = "PUT"
@@ -603,6 +612,26 @@ final class VPNManager: NSObject, ObservableObject {
         // Pass per-app proxy settings as a separate JSON blob
         if let perAppData = defaults.data(forKey: AppConstants.perAppProxySettingsKey) {
             providerConfig["perAppProxy"] = perAppData
+        }
+
+        // Pick ephemeral 127.0.0.1 ports for the SOCKS5, DNS, and REST
+        // controller listeners and forward them to the extension. We
+        // pick in this process (not the extension) so the app's REST
+        // clients learn the controller port without an IPC round-trip
+        // — both targets use a separate UserDefaults.standard, so a
+        // value the extension wrote wouldn't be visible here. The
+        // extension passes these straight to BridgeStartWithPorts.
+        if let socks = EphemeralPort.pickTCP(),
+           let dns = EphemeralPort.pickDNS(),
+           let ctrl = EphemeralPort.pickTCP() {
+            let ctrlAddr = "127.0.0.1:\(ctrl)"
+            providerConfig["socksPort"] = Int(socks)
+            providerConfig["dnsPort"] = Int(dns)
+            providerConfig["controllerAddr"] = ctrlAddr
+            defaults.set(ctrlAddr, forKey: AppConstants.externalControllerAddrKey)
+            dbg("passSettings: ports socks=\(socks) dns=\(dns) ctrl=\(ctrl)")
+        } else {
+            dbg("passSettings: WARN failed to pick ephemeral ports")
         }
 
         proto.providerConfiguration = providerConfig

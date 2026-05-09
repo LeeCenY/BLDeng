@@ -24,6 +24,9 @@ enum ProxyEngineHelper {
     struct EngineContext {
         let tempDir: String
         let configPath: String
+        let socksPort: UInt16
+        let dnsPort: UInt16
+        let controllerAddr: String
     }
 
     /// Start the mihomo engine with the given YAML config.
@@ -46,10 +49,22 @@ enum ProxyEngineHelper {
         // Set home dir and start
         BridgeSetHomeDir(tempDir)
 
+        // Pick test ports up-front so we can pass them to the bridge
+        // and assert against them. Mirrors the production flow.
+        guard let socksPort = EphemeralPort.pickTCP(),
+              let dnsPort = EphemeralPort.pickDNS(),
+              let ctrl = EphemeralPort.pickTCP() else {
+            try? FileManager.default.removeItem(atPath: tempDir)
+            throw NSError(domain: "ProxyEngineHelper", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "could not pick test ports"])
+        }
+        let controllerAddr = "127.0.0.1:\(ctrl)"
+
         var startError: NSError?
-        BridgeStartWithExternalController("127.0.0.1:9090", "", &startError)
+        BridgeStartWithPorts(
+            Int32(socksPort), Int32(dnsPort), controllerAddr, "", &startError
+        )
         if let err = startError {
-            // Clean up on failure
             try? FileManager.default.removeItem(atPath: tempDir)
             throw err
         }
@@ -57,7 +72,13 @@ enum ProxyEngineHelper {
         // Wait for external controller to be ready
         Thread.sleep(forTimeInterval: 1.0)
 
-        return EngineContext(tempDir: tempDir, configPath: configPath)
+        return EngineContext(
+            tempDir: tempDir,
+            configPath: configPath,
+            socksPort: socksPort,
+            dnsPort: dnsPort,
+            controllerAddr: controllerAddr
+        )
     }
 
     /// Stop the engine and clean up temp files.
@@ -70,12 +91,13 @@ enum ProxyEngineHelper {
     /// Run curl through the SOCKS5 proxy and return (stdout, exitCode).
     static func curlThroughProxy(
         url: String,
+        socksPort: UInt16,
         timeout: Int = 10
     ) -> (output: String, exitCode: Int32) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
         process.arguments = [
-            "--socks5", "127.0.0.1:7890",
+            "--socks5", "127.0.0.1:\(socksPort)",
             "--silent",
             "--max-time", "\(timeout)",
             "--write-out", "%{http_code}",

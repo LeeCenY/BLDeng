@@ -21,8 +21,9 @@ import Testing
 /// Integration tests that start/stop the mihomo engine directly via bridge
 /// functions — no VPN tunnel, no system extension, CI-compatible.
 ///
-/// All engine tests must be serialized because BridgeSetHomeDir and the proxy
-/// listener ports (7890, 9090) are process-global state.
+/// All engine tests must be serialized because BridgeSetHomeDir and the
+/// proxy listener ports (chosen ephemerally per run, but still
+/// process-global) are shared state.
 @Suite("Proxy Engine Integration", .serialized)
 struct ProxyEngineIntegrationTests {
 
@@ -36,13 +37,13 @@ struct ProxyEngineIntegrationTests {
         #expect(BridgeIsRunning(), "Engine should be running after start")
     }
 
-    @Test("External controller responds on :9090")
+    @Test("External controller responds")
     func engineExternalController() async throws {
         let ctx = try ProxyEngineHelper.start(config: TestConfigs.minimal)
         defer { ProxyEngineHelper.stop(context: ctx) }
 
         // Hit the external controller REST API
-        let url = URL(string: "http://127.0.0.1:9090/version")!
+        let url = URL(string: "http://\(ctx.controllerAddr)/version")!
         let (data, response) = try await URLSession.shared.data(from: url)
         let httpResponse = try #require(response as? HTTPURLResponse)
         #expect(httpResponse.statusCode == 200, "External controller should return 200")
@@ -102,6 +103,7 @@ struct ProxyEngineIntegrationTests {
         // curl through the SOCKS5 proxy to a reliable endpoint
         let result = ProxyEngineHelper.curlThroughProxy(
             url: "http://www.gstatic.com/generate_204",
+            socksPort: ctx.socksPort,
             timeout: 10
         )
 
@@ -118,11 +120,12 @@ struct ProxyEngineIntegrationTests {
         // Generate some traffic first
         _ = ProxyEngineHelper.curlThroughProxy(
             url: "http://www.gstatic.com/generate_204",
+            socksPort: ctx.socksPort,
             timeout: 10
         )
 
         // Query connections endpoint
-        let url = URL(string: "http://127.0.0.1:9090/connections")!
+        let url = URL(string: "http://\(ctx.controllerAddr)/connections")!
         let (data, response) = try await URLSession.shared.data(from: url)
         let httpResponse = try #require(response as? HTTPURLResponse)
         #expect(httpResponse.statusCode == 200, "Connections endpoint should return 200")
@@ -138,7 +141,7 @@ struct ProxyEngineIntegrationTests {
         defer { ProxyEngineHelper.stop(context: ctx) }
 
         // Query rules endpoint
-        let url = URL(string: "http://127.0.0.1:9090/rules")!
+        let url = URL(string: "http://\(ctx.controllerAddr)/rules")!
         let (data, response) = try await URLSession.shared.data(from: url)
         let httpResponse = try #require(response as? HTTPURLResponse)
         #expect(httpResponse.statusCode == 200, "Rules endpoint should return 200")

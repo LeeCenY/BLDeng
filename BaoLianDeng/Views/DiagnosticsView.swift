@@ -157,9 +157,13 @@ struct DiagnosticsView: View {
                 case .proxyHTTP:
                     result = BridgeTestProxyHTTP("http://www.gstatic.com/generate_204")
                 case .dnsResolver:
-                    result = BridgeTestDNSResolver("127.0.0.1:1053")
+                    let dnsPort = BridgeGetDNSPort()
+                    result = dnsPort > 0
+                        ? BridgeTestDNSResolver("127.0.0.1:\(dnsPort)")
+                        : "VPN not running"
                 case .selectedProxy:
-                    result = BridgeTestSelectedProxy(AppConstants.externalControllerAddr)
+                    result = AppConstants.externalControllerAddr.map(BridgeTestSelectedProxy)
+                        ?? "VPN not running"
                 }
                 continuation.resume(returning: result)
             }

@@ -499,18 +499,23 @@ final class ConfigManager {
     }
 
     func defaultConfig() -> String {
+        // mixed-port / dns.listen / external-controller values below are
+        // placeholders only — the bridge picks ephemeral ports at runtime
+        // (see bridge_start_with_ephemeral_ports) so multiple mihomo
+        // instances on the host don't collide. Editing them in the UI has
+        // no effect on the actual bound ports.
         return """
-        mixed-port: 7890
+        mixed-port: 0
         mode: rule
         log-level: info
         allow-lan: false
-        external-controller: \(AppConstants.externalControllerAddr)
+        external-controller: 127.0.0.1:0
 
         geo-auto-update: false
 
         dns:
           enable: true
-          listen: 127.0.0.1:1053
+          listen: 127.0.0.1:0
           enhanced-mode: redir-host
           nameserver:
             - 114.114.114.114
